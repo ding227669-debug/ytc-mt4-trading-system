@@ -126,6 +126,12 @@ void OnTimer()
       prefetchDone = true;
       PrefetchViaCharts();
    }
+   static int klineTick = 0;
+   klineTick++;
+   if (klineTick % 3 == 0)   // every ~15s
+   {
+      WriteKlineSnapshots();
+   }
    OnTick();
 }
 
@@ -170,6 +176,38 @@ void PrefetchViaCharts()
          ChartRedraw(ch);
       }
       Print("ChartOpen ", syms[i], " => handle ", ch);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Write real-time kline snapshots (M5/M15) from MT4 memory        |
+//+------------------------------------------------------------------+
+void WriteKlineSnapshots()
+{
+   string syms[] = {"XAUUSD","XAGUSD","WTI","BITCOIN"};
+   int periods[] = {PERIOD_M5, PERIOD_M15};
+   string pfx[] = {"M5","M15"};
+   for (int i = 0; i < ArraySize(syms); i++)
+   {
+      for (int j = 0; j < ArraySize(periods); j++)
+      {
+         MqlRates rates[];
+         int copied = CopyRates(syms[i], periods[j], 0, 40, rates);
+         if (copied <= 0) continue;
+         string filename = "market_kline_" + syms[i] + "_" + pfx[j] + ".txt";
+         int fh = FileOpen(filename, FILE_WRITE | FILE_TXT);
+         if (fh == INVALID_HANDLE) continue;
+         for (int k = 0; k < copied; k++)
+         {
+            string line = TimeToString(rates[k].time) + "," +
+                          DoubleToString(rates[k].open, 5) + "," +
+                          DoubleToString(rates[k].high, 5) + "," +
+                          DoubleToString(rates[k].low, 5) + "," +
+                          DoubleToString(rates[k].close, 5) + "\n";
+            FileWriteString(fh, line);
+         }
+         FileClose(fh);
+      }
    }
 }
 
@@ -747,22 +785,18 @@ string ExtractJsonValue(string json, string key)
    while (startPos < StringLen(json) && (StringGetChar(json, startPos) == ' ' || StringGetChar(json, startPos) == '"'))
       startPos++;
    
+   // Find end of value: opening quote already skipped above, so the
+   // NEXT quote is the closing quote (string) or , } (number/bool).
    int endPos = startPos;
-   bool inQuotes = false;
-   
-   // Find end of value
    while (endPos < StringLen(json))
    {
       char c = StringGetChar(json, endPos);
-      if (c == '"' && !inQuotes)
+      if (c == '\\')          // skip escaped char (e.g. \")
       {
-         inQuotes = true;
+         endPos += 2;
+         continue;
       }
-      else if (c == '"' && inQuotes)
-      {
-         break;
-      }
-      else if (!inQuotes && (c == ',' || c == '}'))
+      if (c == '"' || c == ',' || c == '}')
       {
          break;
       }

@@ -11,16 +11,17 @@ YTC 价格行为策略（多周期趋势跟随 + 关键位回调进场）的完�
 
 ```
 ├── ea/                              # MT4 专家顾问（数据桥）
-│   └── MCPBridge_Unified.mq4        #   主 EA：行情采集 + 订单桥 + 历史预热
-├── backtest/                        # 回测工具（Python，读 MT4 .hst 历史文件）
-│   ├── ytc_backtest.py              #   主回测：任意品种/区间 → 机会清单 + 模拟执行
+│   └── MCPBridge_Unified.mq4        #   主 EA：行情采集 + 订单桥 + 历史预热 + 实时K线快照
+├── backtest/                        # 回测与实时扫描工具（Python）
+│   ├── ytc_backtest.py              #   历史回测：任意品种/区间 → 机会清单 + 模拟执行
+│   ├── scan_live.py                 #   实时扫描：EA K线快照 + .hst → 压缩版 YTC 信号
+│   ├── watch_signal.py              #   盯盘：监控关键位 + M5/M15 反转信号（后台运行）
 │   ├── gold_diag.py                 #   诊断：方向/关键位/触碰数（解释为何 0 信号）
 │   └── check_data.py                #   数据检查：各周期 .hst 覆盖范围
-├── strategy/                        # 策略规则文档
-│   └── ytc-price-action-system.md   #   完整可执行策略（量化规则 + 检查清单 + 资金管理）
-└── skills/
-    └── ytc-mt4-backtest/            # Hermes Agent skill（每周回测流程）
+└── README.md
 ```
+
+> 📚 策略规则、宏观思维雷达、技能文档（知识库）在**私有仓库 ytc-trading-knowledge**，不在此公开仓库。
 
 ---
 
@@ -71,6 +72,12 @@ EA 写 `account_info.txt` / `market_data_*.txt` / `positions.txt`；读 `order_c
 ```bash
 # 主回测：比特币 2026-08-24 ~ 08-30
 python ytc_backtest.py BITCOIN 2026-08-24 2026-08-31
+
+# 实时扫描（压缩版 YTC）：读 EA 的 K线快照，找当前信号
+python scan_live.py
+
+# 盯盘：监控比特币 77568 支撑的 M5/M15 反转信号（后台）
+python watch_signal.py
 
 # 诊断（为什么 0 信号）：D1/H4 方向、关键位触碰数
 python gold_diag.py XAUUSD
