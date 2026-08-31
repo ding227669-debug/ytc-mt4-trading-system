@@ -50,6 +50,9 @@ int OnInit()
    // Probe which commodity/crypto symbols exist on this server
    ProbeSymbols();
    
+   // Write contract specs for US indices (lot size / tick value / tick size)
+   WriteSymbolSpecs();
+   
    // Initialize file-based reporting if enabled
    if(EnableFileReporting)
    {
@@ -102,6 +105,7 @@ void OnTick()
       // Process MCP commands
       ProcessOrderCommands();
       ProcessCloseCommands();
+      ProcessModifyCommands();
       ProcessBacktestCommands();
       
       // File-based reporting updates
@@ -158,6 +162,9 @@ void UpdateMarketData()
    WriteMarketData("XAGUSD");
    WriteMarketData("WTI");
    WriteMarketData("BITCOIN");
+   // US equity indices (FVG strategy, 2026-08-31)
+   WriteMarketData("US500");
+   WriteMarketData("NAS100");
 }
 
 //+------------------------------------------------------------------+
@@ -166,7 +173,7 @@ void UpdateMarketData()
 //+------------------------------------------------------------------+
 void PrefetchViaCharts()
 {
-   string syms[] = {"XAGUSD","WTI","XAUUSD","BITCOIN"};
+   string syms[] = {"XAGUSD","WTI","XAUUSD","BITCOIN","US500","NAS100"};
    for (int i = 0; i < ArraySize(syms); i++)
    {
       long ch = ChartOpen(syms[i], PERIOD_H1);
@@ -184,7 +191,7 @@ void PrefetchViaCharts()
 //+------------------------------------------------------------------+
 void WriteKlineSnapshots()
 {
-   string syms[] = {"XAUUSD","XAGUSD","WTI","BITCOIN"};
+   string syms[] = {"XAUUSD","XAGUSD","WTI","BITCOIN","US500","NAS100"};
    int periods[] = {PERIOD_M5, PERIOD_M15};
    string pfx[] = {"M5","M15"};
    for (int i = 0; i < ArraySize(syms); i++)
@@ -507,6 +514,36 @@ void WriteMarketData(string symbol)
 }
 
 //+------------------------------------------------------------------+
+//| Write contract specs (US indices) to file                       |
+//+------------------------------------------------------------------+
+void WriteSymbolSpecs()
+{
+   string syms[] = {"US500", "NAS100"};
+   int fileHandle = FileOpen("symbol_specs.txt", FILE_WRITE | FILE_TXT);
+   if (fileHandle != INVALID_HANDLE)
+   {
+      for (int i = 0; i < ArraySize(syms); i++)
+      {
+         double cs = MarketInfo(syms[i], MODE_LOTSIZE);
+         double tv = MarketInfo(syms[i], MODE_TICKVALUE);
+         double ts = MarketInfo(syms[i], MODE_TICKSIZE);
+         double minlot = MarketInfo(syms[i], MODE_MINLOT);
+         double maxlot = MarketInfo(syms[i], MODE_MAXLOT);
+         double step = MarketInfo(syms[i], MODE_LOTSTEP);
+         double digits = MarketInfo(syms[i], MODE_DIGITS);
+         FileWrite(fileHandle, syms[i] + ": Lotsize=" + DoubleToString(cs, 2) +
+                   " TickValue=" + DoubleToString(tv, 5) +
+                   " TickSize=" + DoubleToString(ts, 5) +
+                   " MinLot=" + DoubleToString(minlot, 2) +
+                   " MaxLot=" + DoubleToString(maxlot, 2) +
+                   " LotStep=" + DoubleToString(step, 2) +
+                   " Digits=" + DoubleToString(digits, 0));
+      }
+      FileClose(fileHandle);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Write positions information to file                             |
 //+------------------------------------------------------------------+
 void WritePositionsInfo()
@@ -592,6 +629,75 @@ void ProcessCloseCommands()
          // Parse and execute the close command
          ExecuteCloseCommand(jsonCommand);
       }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Process modify (SL/TP) commands from MCP server                 |
+//+------------------------------------------------------------------+
+void ProcessModifyCommands()
+{
+   if (FileIsExist("modify_commands.txt"))
+   {
+      int fileHandle = FileOpen("modify_commands.txt", FILE_READ | FILE_TXT);
+      if (fileHandle != INVALID_HANDLE)
+      {
+         string jsonCommand = "";
+         while (!FileIsEnding(fileHandle))
+         {
+            jsonCommand += FileReadString(fileHandle);
+         }
+         FileClose(fileHandle);
+         
+         // Delete the command file after reading
+         FileDelete("modify_commands.txt");
+         
+         // Parse and execute the modify command
+         ExecuteModifyCommand(jsonCommand);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Execute modify command: change stop loss / take profit          |
+//+------------------------------------------------------------------+
+void ExecuteModifyCommand(string jsonCommand)
+{
+   int ticket = (int)StringToInteger(ExtractJsonValue(jsonCommand, "ticket"));
+   string slStr = ExtractJsonValue(jsonCommand, "stop_loss");
+   string tpStr = ExtractJsonValue(jsonCommand, "take_profit");
+   double newSL = StringToDouble(slStr);
+   double newTP = StringToDouble(tpStr);
+   
+   int resultHandle = FileOpen("modify_result.txt", FILE_WRITE | FILE_TXT);
+   
+   if (ticket <= 0 || !OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+   {
+      if (resultHandle != INVALID_HANDLE)
+      {
+         FileWriteString(resultHandle, "{\n\"success\": false,\n\"error\": \"Position not found\",\n\"ticket\": " + IntegerToString(ticket) + "\n}\n");
+         FileClose(resultHandle);
+      }
+      return;
+   }
+   
+   // If only SL provided, keep current TP; if only TP provided, keep current SL
+   double finalSL = (slStr == "") ? OrderStopLoss() : newSL;
+   double finalTP = (tpStr == "") ? OrderTakeProfit() : newTP;
+   
+   bool ok = OrderModify(ticket, OrderOpenPrice(), finalSL, finalTP, 0, clrNONE);
+   
+   if (resultHandle != INVALID_HANDLE)
+   {
+      if (ok)
+      {
+         FileWriteString(resultHandle, "{\n\"success\": true,\n\"ticket\": " + IntegerToString(ticket) + ",\n\"stop_loss\": " + DoubleToString(finalSL, 5) + ",\n\"take_profit\": " + DoubleToString(finalTP, 5) + "\n}\n");
+      }
+      else
+      {
+         FileWriteString(resultHandle, "{\n\"success\": false,\n\"error\": \"OrderModify failed: " + IntegerToString(GetLastError()) + "\",\n\"ticket\": " + IntegerToString(ticket) + "\n}\n");
+      }
+      FileClose(resultHandle);
    }
 }
 
