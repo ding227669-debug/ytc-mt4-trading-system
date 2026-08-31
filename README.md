@@ -10,8 +10,9 @@ YTC 价格行为策略（多周期趋势跟随 + 关键位回调进场）的完�
 ## 目录结构
 
 ```
-├── ea/                              # MT4 专家顾问（数据桥）
-│   └── MCPBridge_Unified.mq4        #   主 EA：行情采集 + 订单桥 + 历史预热 + 实时K线快照
+├── ea/                              # MT4 专家顾问（数据桥 + FVG 自动交易）
+│   ├── MCPBridge_Unified.mq4        #   主 EA：行情采集 + 订单桥 + 历史预热 + 实时K线快照 + 合约规格探测
+│   └── FVG_Autotrader.mq4           #   FVG 开盘区间突破全自动 EA（US500/NAS100，2%风险，2:1止盈）
 ├── backtest/                        # 回测与实时监控工具（Python，纯本地零API成本）
 │   ├── ytc_backtest.py              #   历史回测：任意品种/区间 → 机会清单 + 模拟执行
 │   ├── scan_live.py                 #   单次实时扫描：EA K线快照 + .hst → 压缩版 YTC 信号
@@ -19,6 +20,8 @@ YTC 价格行为策略（多周期趋势跟随 + 关键位回调进场）的完�
 │   ├── monitor_trade.py             #   持仓移动止损：+1R保本，之后每+1R抬一档，平仓弹窗
 │   ├── notify_popup.py              #   Windows 弹窗+Beep 提醒（独立进程，不阻塞监控）
 │   ├── watch_signal.py              #   单点盯盘：监控关键位 + M5/M15 反转信号（一次性）
+│   ├── fvg_backtest.py              #   FVG 策略回测：开盘区间+FVG三K线，任意品种（--m15 强制M15信号）
+│   ├── fvg_watch.py                 #   FVG 实时监控：读 .hst 判区间/FVG，信号弹窗（配合定时任务）
 │   ├── gold_diag.py                 #   诊断：方向/关键位/触碰数（解释为何 0 信号）
 │   └── check_data.py                #   数据检查：各周期 .hst 覆盖范围
 └── README.md
