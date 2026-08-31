@@ -1,0 +1,4 @@
+# 运行缓存（勿提交）
+notify_cache.json
+__pycache__/
+*.pyc

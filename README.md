@@ -12,10 +12,13 @@ YTC 价格行为策略（多周期趋势跟随 + 关键位回调进场）的完�
 ```
 ├── ea/                              # MT4 专家顾问（数据桥）
 │   └── MCPBridge_Unified.mq4        #   主 EA：行情采集 + 订单桥 + 历史预热 + 实时K线快照
-├── backtest/                        # 回测与实时扫描工具（Python）
+├── backtest/                        # 回测与实时监控工具（Python，纯本地零API成本）
 │   ├── ytc_backtest.py              #   历史回测：任意品种/区间 → 机会清单 + 模拟执行
-│   ├── scan_live.py                 #   实时扫描：EA K线快照 + .hst → 压缩版 YTC 信号
-│   ├── watch_signal.py              #   盯盘：监控关键位 + M5/M15 反转信号（后台运行）
+│   ├── scan_live.py                 #   单次实时扫描：EA K线快照 + .hst → 压缩版 YTC 信号
+│   ├── scan_live_daemon.py          #   常驻监控：每30秒扫4品种，合格信号→弹窗+声音提醒
+│   ├── monitor_trade.py             #   持仓移动止损：+1R保本，之后每+1R抬一档，平仓弹窗
+│   ├── notify_popup.py              #   Windows 弹窗+Beep 提醒（独立进程，不阻塞监控）
+│   ├── watch_signal.py              #   单点盯盘：监控关键位 + M5/M15 反转信号（一次性）
 │   ├── gold_diag.py                 #   诊断：方向/关键位/触碰数（解释为何 0 信号）
 │   └── check_data.py                #   数据检查：各周期 .hst 覆盖范围
 └── README.md
@@ -115,6 +118,60 @@ TOTAL: 4 trades, net -4.0R
 4. **进场信号**（M15 优先，无则 H1）：吞没 / pin bar（影线 ≥2×实体）/ inside bar 突破，且价格在关键位区域内
 5. **模拟执行**：进场 = 信号K线收盘价，止损 = 关键位 ×0.999（多）/×1.001（空），止盈 = 2R
 6. **合并规则**：同方向同关键位（±0.2%）24h 内合并为一次机会
+
+## 实时监控系统（弹窗 + 声音提醒）
+
+纯本地运行，**零 API 成本**（不经过任何大模型），信号检测由本地 Python 完成。
+
+### 架构
+
+```
+MT4 (EA) ──每5-15秒──> MQL4\Files\*.txt (价格/K线快照)
+                           │
+                           ▼
+scan_live_daemon.py ──每30秒扫描4品种──> 合格信号?
+                           │ 是
+                           ▼
+notify_popup.py ──> Windows 弹窗 + Beep 声音（独立进程，不阻塞监控）
+```
+
+### 启动方式
+
+```bash
+# 1. 常驻信号监控（4品种：XAUUSD/XAGUSD/WTI/BITCOIN）
+python scan_live_daemon.py
+
+# 2. 持仓移动止损监控（每单一个实例）
+python monitor_trade.py <ticket> <开仓价> <初始止损> <1R点数>
+
+# 3. 单次手动扫描
+python scan_live.py
+```
+
+### 信号纪律（内置在监控逻辑里）
+
+- **只报合格信号**：D1 方向明确（多头/空头）+ 价格在关键位 ±0.2% + M15/M5 反转信号（吞没/Pin Bar/内包突破），三者齐备才提醒
+- D1 震荡（CHOP）的品种**静默**——震荡市信号是噪音，不做
+- **已有同向持仓时同品种信号自动跳过**（不加仓纪律）
+- 同一信号 30 分钟冷却（持久化到 `notify_cache.json`，重启不重复提醒）
+
+### 移动止损纪律（monitor_trade.py）
+
+- 价格 ≥ 开仓 + 1R → 自动调用 `/api/modify` 把止损抬到成本价（保本，零风险）
+- 之后每 +1R 抬一档（+2R 锁 1R 利润，+3R 锁 2R……），利润奔跑
+- 持仓消失（止损触发/平仓）→ 弹窗 + 4 声 Beep 提醒
+
+### 提醒效果
+
+- 信号：弹窗显示「品种/方向/信号类型/关键位/现价」+ 3 声高音 Beep
+- 平仓：弹窗显示「ticket 已平仓」+ 4 声 Beep
+- 弹窗置顶（MB_TOPMOST），不会被其他窗口挡住
+
+### 注意事项
+
+- 需要 MT4 运行 + EA 挂载（K线快照依赖 EA 的 WriteKlineSnapshots，每 15 秒刷新）
+- 监控是本地脚本，电脑关机即停止；持仓的 SL/TP 在 MT4 服务器端，关机也会执行
+- 信号提醒是"辅助"，下单决策请结合策略纪律（知识库 ytc-price-action-system）
 
 ### 已知限制
 
