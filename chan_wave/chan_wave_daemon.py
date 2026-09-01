@@ -44,8 +44,8 @@ chan_wave_daemon.py — 缠论+波浪共振系统守护进程（信号扫描 + �
   已知语义问题，本阶段只在账本备注中记录，不修改算法。
 
 【已知限制】
-  - resonance_engine 的冷却状态（_STATE）是进程内模块级变量；本 daemon 每次
-    运行是独立进程，冷却状态不跨进程持久化（单次运行内 mark_result 立即生效）。
+  - resonance_engine 的冷却状态已跨进程持久化（state/cooldown.json），
+    本 daemon 每次独立进程也能读到最新冷却状态，规则六跨进程生效。
   - 数据不新鲜时（MT4 未运行/图表未打开）品种被跳过，属于预期行为；需保证
     MT4 运行且 4 品种 M5/M30 图表打开过，.hst 才会持续更新。
 """
@@ -687,6 +687,12 @@ def selftest():
     LEDGER_FILE = os.path.join(tmp, "ledger.jsonl")
     LOG_FILE = os.path.join(tmp, "daemon.log")
     NOTIFY_ENABLED = False  # 自测不弹窗
+    # 冷却状态持久化文件也指到临时目录：S6 注入亏损持仓平仓会调用
+    # mark_result(False)，若不隔离会污染真实 state/cooldown.json
+    import resonance_engine
+    resonance_engine.COOLDOWN_FILE = os.path.join(tmp, "cooldown.json")
+    resonance_engine._STATE = {'false_count': 0, 'cooldown': False,
+                               'cool_until': None, 'last_false': None}
     print("=" * 84)
     print("端到端自测开始（临时目录: %s）" % tmp)
     print("=" * 84)

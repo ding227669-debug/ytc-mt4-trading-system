@@ -37,8 +37,12 @@ resonance_engine.py — 缠论+波浪共振决策器 (信号核心)
 
 防主观篡改（编码进模块）：
   - 波浪标签锁定 / 已闭合K线: 由 wave_engine / chan_engine 保证 (调用方只喂已闭合K线)
-  - 模块级冷却: 连续 COOLDOWN_THRESHOLD 次 LONG_OPEN 被 mark_result(False)
-    证伪后, evaluate 直接返回 NONE 并注明冷却原因; mark_result(True) 解除冷却。
+  - 冷却跨进程持久化: 连续 COOLDOWN_THRESHOLD 次 LONG_OPEN 被 mark_result(False)
+    证伪后进入冷却, evaluate 直接返回 NONE 并注明冷却原因; mark_result(True) 解除冷却。
+    状态持久化到 state/cooldown.json（daemon 由计划任务每 30 分钟启动新进程,
+    内存模块级变量无法跨进程生效, 故改为文件持久化; 文件读写失败降级为内存模式）。
+    冷却为全局状态（不分品种）——按规则集原文"连续3次信号被证伪, Agent自动进入
+    冷却"理解为系统级冷却; daemon 单进程顺序跑 4 品种, 无并发写冲突。
 
 已知缺陷（写进注释，用户规则第八条）：
   - 震荡盘整时缠论频繁假背驰、波浪持续 UNCERTAIN → 输出 NONE 空仓（正确行为）
@@ -48,6 +52,8 @@ resonance_engine.py — 缠论+波浪共振决策器 (信号核心)
 禁止：本模块不含任何下单/交易功能。
 """
 
+import os
+import json
 import datetime
 
 # ==================== 决策参数 (集中于此, 便于后续标定) ====================
@@ -60,28 +66,108 @@ POS_B3 = 0.2                # M30 B3 买点共振 -> 0.2 (低优先级买点, �
 REDUCE_RATIO = 0.5          # 减仓比例 50%
 # --- 冷却 (规则六: 连续 3 次信号被证伪 -> 冷却) ---
 COOLDOWN_THRESHOLD = 3
+COOLDOWN_DAYS = 7           # 冷却时长（规则集未定义时长, 默认 7 天, 可标定）
 # ==========================================================================
 
-# ==================== 模块级状态 (冷却 / 证伪计数) ====================
-# 由调用方通过 mark_result(True/False) 反馈最近一次 LONG_OPEN 是否被证伪
-_STATE = {'false_count': 0, 'cooldown': False}
+# ==================== 模块级状态 (冷却 / 证伪计数, 跨进程持久化) ====================
+# 由调用方通过 mark_result(True/False) 反馈最近一次 LONG_OPEN 是否被证伪。
+# 状态持久化到 state/cooldown.json —— daemon 由 Windows 计划任务每 30 分钟
+# 启动一次新进程, 纯内存变量无法跨进程生效, 故每次 evaluate/mark_result
+# 都先读文件再写回。文件读写失败时降级为进程内内存模式（不崩溃）。
+# 注意: 冷却为全局状态, 不分品种（规则集原文"连续3次信号被证伪, Agent自动
+# 进入冷却"理解为系统级冷却; daemon 单进程顺序跑 4 品种, 无并发写冲突）。
+STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+COOLDOWN_FILE = os.path.join(STATE_DIR, "cooldown.json")
+_STATE = {'false_count': 0, 'cooldown': False,
+          'cool_until': None, 'last_false': None}
+
+
+def _load_cooldown():
+    """从 state/cooldown.json 读取冷却状态到内存镜像 _STATE。
+
+    文件不存在 / 损坏 / IO 错误 → 保持内存默认（降级为内存模式, 不抛异常）。
+    """
+    try:
+        with open(COOLDOWN_FILE, 'r', encoding='utf-8') as f:
+            st = json.load(f)
+        _STATE['false_count'] = int(st.get('false_count', 0))
+        _STATE['cooldown'] = bool(st.get('cooldown', False))
+        _STATE['cool_until'] = st.get('cool_until')
+        _STATE['last_false'] = st.get('last_false')
+    except Exception:
+        pass  # 缺失/损坏 → 保持内存默认
+
+
+def _save_cooldown():
+    """把内存冷却状态写回 state/cooldown.json（临时文件+原子替换）。
+
+    失败 → 仅保留内存状态（降级）, 不抛异常。
+    """
+    tmp = None
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = COOLDOWN_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_STATE, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, COOLDOWN_FILE)
+    except Exception:
+        if tmp:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+
+def _cooling_active():
+    """冷却是否生效。cooldown=True 且未到期 → True（evaluate 返回 NONE）。
+
+    cool_until 为 None（旧格式/降级）→ 视为永久冷却, 保持旧行为;
+    cool_until 已过期 → 自动解除冷却并写回文件。
+    """
+    if not _STATE['cooldown']:
+        return False
+    until = _STATE.get('cool_until')
+    if until:
+        try:
+            exp = datetime.datetime.fromisoformat(until)
+            if datetime.datetime.now(datetime.timezone.utc) >= exp:
+                # 冷却到期, 自动解除（规则六: 冷却期结束恢复输出信号）
+                _STATE['cooldown'] = False
+                _STATE['false_count'] = 0
+                _STATE['cool_until'] = None
+                _save_cooldown()
+                return False
+        except Exception:
+            pass  # 时间解析失败 → 按冷却处理（保守）
+    return True
 
 
 def mark_result(correct):
-    """调用方反馈最近一次 LONG_OPEN 是否被后续行情证伪。
+    """调用方反馈最近一次 LONG_OPEN 是否被后续行情证伪（接口不变）。
 
     correct=True  : 信号有效, 清零证伪计数并解除冷却
     correct=False : 信号被证伪, 计数+1; 连续 COOLDOWN_THRESHOLD 次
                     证伪后进入冷却, 冷却期间 evaluate 直接返回 NONE。
+    状态持久化到 state/cooldown.json（跨进程生效）; 文件读写失败时
+    降级为进程内内存模式, 不抛异常。
     """
+    _load_cooldown()  # 先读最新持久化状态（跨进程）
+    now = datetime.datetime.now(datetime.timezone.utc)
     if correct:
         _STATE['false_count'] = 0
         _STATE['cooldown'] = False
+        _STATE['cool_until'] = None
+        _STATE['last_false'] = None
     else:
         _STATE['false_count'] += 1
+        _STATE['last_false'] = now.isoformat()
         if _STATE['false_count'] >= COOLDOWN_THRESHOLD:
             _STATE['cooldown'] = True
             _STATE['false_count'] = 0
+            _STATE['cool_until'] = (now + datetime.timedelta(
+                days=COOLDOWN_DAYS)).isoformat()
+    _save_cooldown()
 
 
 # ==================== 内部工具 ====================
@@ -94,15 +180,16 @@ def _close_condition_text(stop):
             '或M30出现S2/S3卖点; 或周线BULL转BEAR —— 任一触发全部平仓')
 
 
-def _closed_below_2bars(chan_m30, defend):
-    """LONG_CLOSE 条件①: 连续 2 根 M30 收盘价 < defend_price (盘中穿刺不算)。
+def _closed_below_2bars(chan, defend):
+    """LONG_CLOSE 条件①: 连续 2 根收盘价 < defend_price (盘中穿刺不算)。
 
+    chan: 任一级别 chan_engine.compute 输出 (生产=M30, 日线慢速版回测=DAY)。
     按 chan_engine details.close_hist (最近3根收盘) 判断; 数据不足时
     退化为单根收盘判断。
     """
     if not defend or defend <= 0:
         return False
-    d = chan_m30.get('details') or {}
+    d = chan.get('details') or {}
     hist = d.get('close_hist') or []
     if len(hist) >= 2:
         return hist[-1] < defend and hist[-2] < defend
@@ -156,16 +243,27 @@ def evaluate(symbol, wave_week, chan_day, chan_m30, chan_m5, volatility):
     check = []      # check_list: 各检查项通过/不通过说明
     reason = []     # reason: 信号原因标签
     ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    # ---- 周期缺失降级 (日线慢速版回测: 仅周线波浪+日线缠论) ----
+    # 生产配置传入真实 M30/M5 chan_result, 行为与历史完全一致;
+    # chan_m30/chan_m5 传 None 表示该周期不参与 (回测降级):
+    #   买点判定改用日线买点, M30/M5 背驰与卖点检查跳过, 止损位取日线防守价。
+    m30_missing = chan_m30 is None
+    m5_missing = chan_m5 is None
+    chan_m30 = chan_m30 or {}
+    chan_m5 = chan_m5 or {}
+    chan_day = chan_day or {}
     wl = wave_week.get('wave_label')
     ws = wave_week.get('wave_status')
     bias = wave_week.get('bias')
     broken = wave_week.get('wave_broken', False)
-    defend = chan_m30.get('defend_price') or 0.0
+    defend = chan_m30.get('defend_price') or chan_day.get('defend_price') or 0.0
 
-    # ---------- 0. 冷却状态 (规则六) ----------
-    if _STATE['cooldown']:
+    # ---------- 0. 冷却状态 (规则六, 跨进程持久化) ----------
+    _load_cooldown()  # 读取 state/cooldown.json 最新状态（跨进程生效）
+    if _cooling_active():
         check.append('冷却中: 连续%d次LONG_OPEN被证伪, 暂停输出新信号'
-                     % COOLDOWN_THRESHOLD)
+                     ' (冷却至 %s)' % (COOLDOWN_THRESHOLD,
+                                    _STATE.get('cool_until') or '待定'))
         return _out(symbol, 'NONE', 0.0, defend, check, ['冷却中'], ts)
 
     # ---------- 一、全局前置过滤 (最高优先级) ----------
@@ -195,10 +293,12 @@ def evaluate(symbol, wave_week, chan_day, chan_m30, chan_m5, volatility):
         check.append('LONG_CLOSE: 周线浪型结构破坏(wave_broken=True), 全部离场')
         return _out(symbol, 'LONG_CLOSE', 0.0, defend, check,
                     ['浪型破坏'], ts)
-    # LONG_CLOSE 条件①: 收盘价有效跌破止损位, 连续2根M30收盘 < defend_price
-    if _closed_below_2bars(chan_m30, defend):
-        check.append('LONG_CLOSE: 连续2根M30收盘价<止损位%.2f(盘中穿刺不算), 全部平仓'
-                     % defend)
+    # LONG_CLOSE 条件①: 收盘价有效跌破止损位, 连续2根收盘 < defend_price
+    #   (生产: M30收盘; 日线慢速版降级: M30缺失, 用日线收盘)
+    if _closed_below_2bars(chan_day if m30_missing else chan_m30, defend):
+        lvl = '日线' if m30_missing else 'M30'
+        check.append('LONG_CLOSE: 连续2根%s收盘价<止损位%.2f(盘中穿刺不算), 全部平仓'
+                     % (lvl, defend))
         return _out(symbol, 'LONG_CLOSE', 0.0, defend, check,
                     ['收盘破止损'], ts)
     # LONG_CLOSE 条件③: M30 出现 S2/S3 卖点 (线段反转)
@@ -258,22 +358,32 @@ def evaluate(symbol, wave_week, chan_day, chan_m30, chan_m5, volatility):
         check.append('日线顶卖点检查: 日线存在%s顶卖点, 不加仓'
                      % chan_day.get('sell_point'))
         ok = False
-    # 条件3: M30 买点 B1/B2 (B3 允许但优先级低) + M30 背驰确认
-    bp = chan_m30.get('buy_point')
+    # 条件3: 买点 B1/B2 (B3 允许但优先级低) + 背驰确认
+    #   (生产: M30 买点; 日线慢速版降级: M30缺失, 以日线买点为准)
+    bp = chan_day.get('buy_point') if m30_missing else chan_m30.get('buy_point')
     c3 = bp in ('B1', 'B2', 'B3')
-    check.append('M30买点检查: buy_point=%s beichi=%s -> %s'
-                 % (bp, chan_m30.get('beichi'), '通过' if c3 else '不通过'))
+    check.append('%s买点检查: buy_point=%s -> %s'
+                 % ('日线' if m30_missing else 'M30', bp,
+                    '通过' if c3 else '不通过'))
     if not c3:
         ok = False
     if not chan_m30.get('beichi'):
-        check.append('M30背驰检查: M30无背驰确认(beichi=False), 不通过')
-        ok = False
+        if m30_missing:
+            check.append('M30背驰检查(降级): M30缺失, 跳过背驰确认')
+        else:
+            check.append('M30背驰检查: M30无背驰确认(beichi=False), 不通过')
+            ok = False
     # 条件4: M5 次级别背驰确认 (不允许提前预判抄底); M5 不能处于强烈顶背驰
-    c4 = chan_m5.get('beichi') is True
-    check.append('M5背驰检查: beichi=%s -> %s'
-                 % (chan_m5.get('beichi'), '通过' if c4 else '不通过'))
-    if not c4:
-        ok = False
+    #   (日线慢速版降级: M5缺失, 跳过次级别确认)
+    if m5_missing:
+        c4 = True
+        check.append('M5背驰检查(降级): M5缺失, 跳过次级别背驰确认')
+    else:
+        c4 = chan_m5.get('beichi') is True
+        check.append('M5背驰检查: beichi=%s -> %s'
+                     % (chan_m5.get('beichi'), '通过' if c4 else '不通过'))
+        if not c4:
+            ok = False
     if chan_m5.get('sell_point') in ('S1', 'S2'):
         check.append('M5顶卖点检查: M5处于%s强烈顶背驰, 否决' % chan_m5.get('sell_point'))
         ok = False
@@ -291,7 +401,9 @@ def evaluate(symbol, wave_week, chan_day, chan_m30, chan_m5, volatility):
 
     # ---------- 五、仓位计算 (规则二+五, 硬上限 0.6) ----------
     pos = _calc_position(wl, bp)
-    reason = ['周线波浪多头', 'M30缠论%s买点' % bp, 'M5背驰确认', '浪型完好']
+    bp_src = '日线缠论' if m30_missing else 'M30缠论'
+    reason = ['周线波浪多头', '%s%s买点' % (bp_src, bp),
+              'M5背驰确认' if not m5_missing else 'M5缺失跳过', '浪型完好']
     if bp == 'B3':
         reason.append('B3低优先级买点, 仓位从轻')
     if wl == '5':
@@ -384,15 +496,22 @@ if __name__ == '__main__':
             ensure_ascii=False))
 
     # ---- 冷却机制演示 (规则六: 连续3次证伪 -> 冷却) ----
+    # 用临时文件演示, 避免污染真实 state/cooldown.json
     print('\n' + '=' * 84)
     print('冷却机制演示 (连续3次 LONG_OPEN 被证伪 -> 冷却 -> NONE)')
     print('=' * 84)
+    import tempfile
+    _demo_file = os.path.join(tempfile.gettempdir(), 'chan_wave_cooldown_demo.json')
+    _orig_file = globals()['COOLDOWN_FILE']
+    globals()['COOLDOWN_FILE'] = _demo_file
     _STATE['false_count'] = 0
     _STATE['cooldown'] = False
+    _STATE['cool_until'] = None
     for i in range(1, 4):
         mark_result(False)
-        print('  mark_result(False) 第%d次: false_count=%d cooldown=%s'
-              % (i, _STATE['false_count'], _STATE['cooldown']))
+        print('  mark_result(False) 第%d次: false_count=%d cooldown=%s cool_until=%s'
+              % (i, _STATE['false_count'], _STATE['cooldown'],
+                 _STATE['cool_until']))
     dummy = {'wave_label': '3', 'wave_status': 'RUNNING', 'bias': 'BULL',
              'wave_broken': False, 'details': {}}
     demo = evaluate('XAUUSD', dummy, {}, {}, {}, {'atr_pct': 1.0, 'abnormal': False})
@@ -401,4 +520,10 @@ if __name__ == '__main__':
     mark_result(True)
     print('  mark_result(True) 解除冷却 -> cooldown=%s false_count=%s'
           % (_STATE['cooldown'], _STATE['false_count']))
+    globals()['COOLDOWN_FILE'] = _orig_file
+    try:
+        if os.path.exists(_demo_file):
+            os.remove(_demo_file)
+    except Exception:
+        pass
     print('\n自测完成 (python resonance_engine.py 无报错)')

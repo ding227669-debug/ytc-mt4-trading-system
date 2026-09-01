@@ -20,7 +20,10 @@ wave_engine.py — 艾略特波浪自动数浪引擎（周线级别）
     'wave_status': 'RUNNING', # COMPLETE(当前浪已走完)/RUNNING(正在运行)/UNCERTAIN(无法可靠数浪)
     'bias': 'BULL',           # BULL/BEAR/NEUTRAL，大方向
     'wave_broken': False,     # 浪型结构是否被价格击穿破坏
-    'details': {'swings': [...], 'label_checks': {...}, 'last_close': float, 'atr': float}
+    'details': {'swings': [...], 'label_checks': {...}, 'last_close': float,
+                'atr': float, 'bars_count': int, 'last_range': float}
+    # bars_count: 输入K线根数; last_range: 最近一根K线真实波幅(high-low)
+    # —— 供 daemon.compute_volatility 的异常波动率开关(abnormal)判定使用
   }
 
 禁止：本模块不含任何下单/交易功能。
@@ -536,7 +539,8 @@ def _empty_result(level):
             'bias': 'NEUTRAL',
             'wave_broken': False,
             'details': {'swings': [], 'label_checks': {},
-                        'last_close': 0.0, 'atr': 0.0}}
+                        'last_close': 0.0, 'atr': 0.0,
+                        'bars_count': 0, 'last_range': 0.0}}
 
 
 def compute(candles, level='WEEK'):
@@ -578,6 +582,8 @@ def compute(candles, level='WEEK'):
             res = prev['result']
             res['details']['last_close'] = last_close
             res['details']['atr'] = atr
+            res['details']['bars_count'] = len(candles)
+            res['details']['last_range'] = candles[-1]['high'] - candles[-1]['low']
             res['details']['swings'] = swings[-MAX_SWINGS_KEEP:]
             _CACHE.update({'key': key, 'result': res, 'last_swing': last_swing,
                            'broken_level': lvl, 'bias': prev['bias']})
@@ -597,6 +603,8 @@ def compute(candles, level='WEEK'):
         },
         'last_close': last_close,
         'atr': atr,
+        'bars_count': len(candles),
+        'last_range': candles[-1]['high'] - candles[-1]['low'],
         'last_swing_time': swings[-1]['time'] if swings else None,
     }
     res = {'level': level,

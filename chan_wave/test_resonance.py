@@ -6,9 +6,22 @@
       / 冷却机制。
 """
 import sys
+import os
 import json
+import tempfile
 sys.path.insert(0, r'C:\Users\Administrator\Documents\Trading\chan_wave')
 import resonance_engine as re
+
+# ---- 冷却状态隔离：把持久化文件指到临时文件并重置，避免受/污染真实
+#      state/cooldown.json（21 分支测试可重复运行，且不依赖真实冷却状态）----
+re.COOLDOWN_FILE = os.path.join(tempfile.gettempdir(),
+                                'chan_wave_test_resonance_cooldown.json')
+try:
+    os.remove(re.COOLDOWN_FILE)
+except OSError:
+    pass
+re._STATE = {'false_count': 0, 'cooldown': False,
+             'cool_until': None, 'last_false': None}
 
 # ---- 基础输入构造 ----
 def wave(label='3', status='RUNNING', bias='BULL', broken=False):

@@ -31,9 +31,12 @@ chan_engine.py — 缠论核心算法引擎 (模拟盘信号研究项目, 只做
      同向笔必须创新高/新低才延续, 反向笔(回调)与线段区间重叠即可
   5. 中枢: 连续 ZS_MIN_BI 笔的重叠区间 [ZG=min(高点), ZD=max(低点)],
      之后连续 ZS_EXIT_BI 笔完全脱离区间才确认中枢结束 (简化: 不做扩展合并)
-  6. 背驰: MACD(12,26,9) 柱面积比较 —— 最后中枢的离开段(b, 中枢后全部笔)
+  6. 背驰: MACD(12,26,9) 柱面积比较 (默认) —— 最后中枢的离开段(b, 中枢后全部笔)
      与进入段(a, 中枢前最近同向笔) 比较: 价格创新高/新低 且 同色柱面积缩小
-     => 背驰 (顶背驰/底背驰); 无中枢时退化为比较最后两笔同向笔
+     => 背驰 (顶背驰/底背驰); 无中枢时退化为比较最后两笔同向笔。
+     背驰比较方式可配置 (BEICHI_MODE): 'area'=柱面积比较(默认) /
+     'dif_peak'=DIF峰值比较 (标定用, 直接比较 a/b 段 DIF 极值, 不看面积)。
+     MACD 周期参数 (MACD_FAST/SLOW/SIGNAL) 亦为模块级常量, 支持回测标定。
   7. 买卖点:
      B1 = 下跌趋势末端底背驰 (价格新低 + MACD绿柱面积缩小)
      B2 = B1 后存在历史回调笔, 回调低点不破 B1 低点, 且回调笔之后未再跌破
@@ -42,7 +45,8 @@ chan_engine.py — 缠论核心算法引擎 (模拟盘信号研究项目, 只做
      B3 = 突破中枢上沿(ZG)后回踩, 回踩低点不跌回中枢内
      S1/S2/S3 对称 (顶背驰 / 反弹不破前高 / 跌破中枢下沿后反抽不回中枢)
   8. trend: 最后中枢方向 + 最近笔方向 + 现价相对中枢位置
-  9. defend_price: 最近买点对应的防守位 (B1/B3=中枢下沿, B2=B1低点, 无中枢=B1低点)
+  9. defend_price: 最近买点对应的防守位 (B1 按 DEFEND_MODE 计算, 默认=中枢下沿;
+     B2=B1低点, B3=中枢下沿; 无中枢=B1低点)。DEFEND_MODE 见模块顶部参数注释。
 
 用法:
   python chan_engine.py          # 自测: 读 XAUUSD1440/M30 运行 compute 并打印摘要
@@ -75,6 +79,25 @@ ZS_EXIT_BI = 3          # 连续几笔完全脱离中枢区间才确认中枢结
 BEICHI_RATIO = 1.0      # 背驰面积缩小判定: b段面积 < a段面积 * BEICHI_RATIO 即为缩小
                         # (=1.0 表示严格小于; 调低如 0.8 要求缩小 20% 才判背驰, 更保守)
 USE_DIF_PEAK_FALLBACK = True   # 面积均为0时, 退化为用 DIF 极值比较 (True=启用)
+BEICHI_MODE = 'area'    # 背驰比较方式: 'area'=MACD柱面积比较(默认, 原行为)
+                        #   'dif_peak'=DIF峰值比较(标定用, 不看面积直接比较 a/b 段 DIF 极值)
+                        # 注: calc_macd 默认参数取模块级常量, 支持回测标定时 monkey-patch
+
+# --- 防守价(defend_price)参数 (参数标定阶段2: B1买点防守位定义对比) ---
+# DEFEND_MODE 只影响 B1 (背驰类买点) 的 defend 计算:
+#   'zs_low'    = 最近中枢下沿 (默认, 与原行为完全一致)。已知缺陷: B1 出现在
+#                下跌趋势末端(价格创新低), 此时"最近中枢"在价格上方,
+#                defend_price 可能高于现价 -> 无效止损(daemon 表现为"收盘破止损"误判)
+#   'b1_low'    = B1 买点低点本身 (背驰极值低点 b_ext, 最紧的止损)
+#   'b1_atr'    = B1 买点低点 - DEFEND_ATR_MULT × ATR(DEFEND_ATR_PERIOD)
+#                (低点下方留一个 ATR 缓冲, 防止最紧止损被毛刺扫掉)
+#   'seg_start' = 背驰段(离开段/b段)起点下方: 取背驰段第一只同向笔的摆动低点
+#                (即"当前趋势段起始摆动低点"; 对底背驰 = 末段下跌第一腿的低点)
+# B2 (回调类) 的 defend 保持"B1低点"、B3 (突破类) 的 defend 保持"中枢下沿"不变 ——
+# 回调/突破类买点出现时价格已在中枢上方/回调低点高于B1低点, 原语义更合理。
+DEFEND_MODE = 'b1_low'          # B1 防守位定义 (阶段2标定结论: 'zs_low'中枢下沿在B1场景100%无效止损, 已切换'b1_low'; 回测扫描时 monkey-patch 切换)
+DEFEND_ATR_MULT = 1.0           # 'b1_atr' 模式: B1 低点下方 ATR 倍数
+DEFEND_ATR_PERIOD = 14          # 'b1_atr' 模式 ATR 周期
 # ==========================================================================
 
 
@@ -325,10 +348,17 @@ def _ema(values, period):
     return out
 
 
-def calc_macd(closes, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
+def calc_macd(closes, fast=None, slow=None, signal=None):
     """MACD: 返回 (dif, dea, hist), hist = 2*(DIF-DEA) (国内惯例乘2, 不影响面积比较)。
     数据不足 (len < slow+signal) 时返回 (None, None, None)。
-    """
+    fast/slow/signal 为 None 时取模块级 MACD_FAST/MACD_SLOW/MACD_SIGNAL
+    —— 支持回测标定时 monkey-patch 模块级常量直接生效。"""
+    if fast is None:
+        fast = MACD_FAST
+    if slow is None:
+        slow = MACD_SLOW
+    if signal is None:
+        signal = MACD_SIGNAL
     if len(closes) < slow + signal:
         return None, None, None
     ema_f = _ema(closes, fast)
@@ -337,6 +367,30 @@ def calc_macd(closes, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
     dea = _ema(dif, signal)
     hist = [2.0 * (d - e) for d, e in zip(dif, dea)]
     return dif, dea, hist
+
+
+def _compute_atr(candles, period=None):
+    """ATR (Wilder 平滑, 公式与 wave_engine.compute_atr 一致)。
+
+    供 'b1_atr' 防守位模式使用 (B1 低点下方留 DEFEND_ATR_MULT×ATR 缓冲)。
+    输入不足 period 根时退回简单平均波幅; 不足 2 根返回 0.0。
+    """
+    if period is None:
+        period = DEFEND_ATR_PERIOD
+    if len(candles) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        c, p = candles[i], candles[i - 1]
+        trs.append(max(c['high'] - c['low'],
+                       abs(c['high'] - p['close']),
+                       abs(c['low'] - p['close'])))
+    if len(trs) < period:
+        return sum(trs) / len(trs)
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
 
 
 # ---------------------------------------------------------------- 6. 背驰
@@ -388,6 +442,9 @@ def _beichi_for_zs(zs, bis, dif, hist):
     # b 段起点: end_bar 之后第一只同向笔; 若中枢延伸吸光了后续笔, 回溯到极值笔
     after_end = [b for b in all_after if b['start'] >= zs['end_bar'] and b['dir'] == b_dir]
     b_start = after_end[0]['start'] if after_end else b_end_bi['start']
+    # b 段区间下界: 中枢延伸吸收离开笔时 b_start 可能 > b_end_bi['end']
+    # (面积模式空切片=0 不报错, DIF 峰值模式 max() 会炸) -> 取下界 min
+    b_lo = min(b_start, b_end_bi['start'])
     # a 段: 中枢前最近同向笔
     before = [b for b in bis if b['end'] <= zs['start_bar']]
     a_bi = None
@@ -410,20 +467,32 @@ def _beichi_for_zs(zs, bis, dif, hist):
         b_area = sum(max(0.0, -x) for x in hist[b_start:b_end + 1])
         new_ext = b_ext < a_ext
     shrink = (a_area > 0 and b_area < a_area * BEICHI_RATIO)
-    if not shrink and USE_DIF_PEAK_FALLBACK and a_area == 0 and b_area == 0:
+    if BEICHI_MODE == 'dif_peak':
+        # DIF 峰值比较 (标定模式): 不看面积, 直接比较 a/b 段 DIF 极值
+        #   UP(顶背驰): b 段 DIF 峰值 < a 段峰值; DOWN(底背驰): b 段谷值 > a 段谷值
+        if b_dir == 'UP':
+            a_peak = max(dif[a_bi['start']:a_bi['end'] + 1])
+            b_peak = max(dif[b_lo:b_end + 1])
+        else:
+            a_peak = min(dif[a_bi['start']:a_bi['end'] + 1])
+            b_peak = min(dif[b_lo:b_end + 1])
+        shrink = (b_peak < a_peak) if b_dir == 'UP' else (b_peak > a_peak)
+    elif not shrink and USE_DIF_PEAK_FALLBACK and a_area == 0 and b_area == 0:
         # 面积全为0 (极端行情), 退化为 DIF 峰值比较
         if b_dir == 'UP':
             a_peak = max(dif[a_bi['start']:a_bi['end'] + 1])
-            b_peak = max(dif[b_start:b_end + 1])
+            b_peak = max(dif[b_lo:b_end + 1])
         else:
             a_peak = min(dif[a_bi['start']:a_bi['end'] + 1])
-            b_peak = min(dif[b_start:b_end + 1])
+            b_peak = min(dif[b_lo:b_end + 1])
         shrink = (b_peak < a_peak) if b_dir == 'UP' else (b_peak > a_peak)
     if new_ext and shrink:
         return {'type': 'top' if b_dir == 'UP' else 'bottom',
                 'a_bi': a_bi, 'b_bi': b_end_bi,
                 'a_ext': a_ext, 'b_ext': b_ext,
-                'a_area': a_area, 'b_area': b_area}
+                'a_area': a_area, 'b_area': b_area,
+                'b_start': b_start}   # 背驰段(b段/离开段)起点 bar 索引
+                                      # (供 DEFEND_MODE='seg_start' 取背驰段起点摆动低点)
     return None
 
 
@@ -459,11 +528,21 @@ def detect_beichi(bis, zs_list, dif, hist):
         b_area = sum(max(0.0, -x) for x in hist[b_bi['start']:b_bi['end'] + 1])
         new_ext = b_ext < a_ext
     shrink = (a_area > 0 and b_area < a_area * BEICHI_RATIO)
+    if BEICHI_MODE == 'dif_peak':
+        # DIF 峰值比较 (标定模式, 退化路径同样支持)
+        if b_dir == 'UP':
+            a_peak = max(dif[a_bi['start']:a_bi['end'] + 1])
+            b_peak = max(dif[b_bi['start']:b_bi['end'] + 1])
+        else:
+            a_peak = min(dif[a_bi['start']:a_bi['end'] + 1])
+            b_peak = min(dif[b_bi['start']:b_bi['end'] + 1])
+        shrink = (b_peak < a_peak) if b_dir == 'UP' else (b_peak > a_peak)
     if new_ext and shrink:
         return {'type': 'top' if b_dir == 'UP' else 'bottom',
                 'a_bi': a_bi, 'b_bi': b_bi,
                 'a_ext': a_ext, 'b_ext': b_ext,
-                'a_area': a_area, 'b_area': b_area}
+                'a_area': a_area, 'b_area': b_area,
+                'b_start': b_bi['start']}   # 退化路径: 背驰段=最后一笔, 起点即其起点
     return None
 
 
@@ -506,7 +585,36 @@ def detect_trend(bis, zs_list, last_close):
 
 
 # ---------------------------------------------------------------- 7. 买卖点
-def detect_points(bis, zs_list, events):
+def _defend_b1(b1_ev, bis, candles, atr):
+    """按 DEFEND_MODE 计算 B1 买点防守价 (语义详见模块顶部参数注释)。
+
+    只影响 B1 (背驰类买点); B2/B3 的 defend 在 detect_points 中保持不变。
+    b1_ev: {'ev': 背驰dict, 'zs': 对应中枢或 None}; ev 含 b_ext(B1低点)/b_start。
+    返回 defend 价格 (zs_low 无中枢时退化为 B1 低点, 与原行为一致)。
+    """
+    ev = b1_ev['ev']
+    b1_low = ev['b_ext']                    # B1 买点低点 = 背驰极值低点
+    mode = DEFEND_MODE
+    if mode == 'b1_low':
+        return b1_low
+    if mode == 'b1_atr':
+        return b1_low - DEFEND_ATR_MULT * atr
+    if mode == 'seg_start':
+        # 背驰段(离开段/b段)起点下方: 取背驰段第一只同向笔的摆动低点
+        # (当前趋势段起始摆动低点; 对底背驰 = 末段下跌第一腿的低点)
+        b_start = ev.get('b_start')
+        if b_start is not None:
+            for b in bis:
+                if b['start'] == b_start:   # b_start 即该笔的起点 bar
+                    return b['low']
+            if candles and 0 <= b_start < len(candles):
+                return candles[b_start]['low']   # 兜底: 起点 bar 的最低价
+        return b1_low                       # 无背驰段信息 -> 退化为 B1 低点
+    # 默认 'zs_low': 最近中枢下沿; 无中枢时用 B1 低点 (与原行为完全一致)
+    return b1_ev['zs']['low'] if b1_ev['zs'] else b1_low
+
+
+def detect_points(bis, zs_list, events, candles=None, atr=0.0):
     """买卖点检测 (基于历史背驰事件 + 最新笔结构, 简化规则)。
 
     参数 events: scan_beichi_events 的返回 (按时间序的背驰事件列表)。
@@ -516,7 +624,8 @@ def detect_points(bis, zs_list, events):
       B3: 存在 UP 笔突破最后中枢上沿 ZG, 且其后最近一笔是 DOWN 且低点 > ZG
       S1/S2/S3 对称。
     返回 (buy_point, sell_point, defend_price):
-      defend = B1/B3 时最后中枢下沿(无中枢用 B1 低点), B2 时 B1 低点。
+      defend = B1 时按 DEFEND_MODE 计算 (默认=最后中枢下沿, 无中枢用 B1 低点);
+               B3 时最后中枢下沿, B2 时 B1 低点 (回调/突破类保持原语义不变)。
     """
     if not bis:
         return None, None, 0.0
@@ -567,7 +676,9 @@ def detect_points(bis, zs_list, events):
     # ---- 一买/一卖 (最近背驰事件) ----
     if b1_ev:
         buy, buy_sig = 'B1', b1_ev['ev']['b_bi']['end']
-        defend = b1_ev['zs']['low'] if b1_ev['zs'] else b1_ev['ev']['b_ext']
+        # B1 防守价按 DEFEND_MODE 计算 (阶段2标定参数, 见模块顶部注释);
+        # 默认 'zs_low' = 最近中枢下沿(无中枢用 B1 低点), 与原行为完全一致
+        defend = _defend_b1(b1_ev, bis, candles, atr)
     if s1_ev:
         sell, sell_sig = 'S1', s1_ev['ev']['b_bi']['end']
 
@@ -661,7 +772,9 @@ def compute(candles, level):
     # 7. 趋势
     trend = detect_trend(bis, zs_list, closes[-1])
     # 8. 买卖点 + 防守价 (基于背驰事件)
-    buy_point, sell_point, defend_price = detect_points(bis, zs_list, events)
+    atr_day = _compute_atr(candles)          # 日线 ATR (供 b1_atr 防守位模式)
+    buy_point, sell_point, defend_price = detect_points(bis, zs_list, events,
+                                                        candles, atr_day)
 
     bi_out = [{'start': b['start'], 'end': b['end'], 'dir': b['dir']} for b in bis]
     return {
@@ -686,6 +799,8 @@ def compute(candles, level):
             'zs_count': len(zs_list),
             'beichi_detail': events[-1]['ev'] if events else None,  # 最近背驰事件详情
             'beichi_events': len(events),      # 全历史背驰事件数 (供标定参考)
+            'defend_mode': DEFEND_MODE,        # 当前 B1 防守位定义 (阶段2标定)
+            'atr_day': round(atr_day, 6),      # 日线 ATR(14) (b1_atr 模式/止损距离统计用)
             'dif_last': dif[-1] if dif else None,
             'dea_last': dea[-1] if dea else None,
             'hist_last': hist[-1] if hist else None,

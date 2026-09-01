@@ -1,0 +1,35 @@
+volatility_stats_report — 4品种日线 ATR_pct 分布（自动生成: 2026-09-01 15:36:34）
+口径: 每根日线K线位置的 ATR(14)(Wilder平滑) / 收盘价 * 100 (%); 数据源 C:\Program Files (x86)\Alpari MT4\history\Alpari-Demo\<SYM>1440.hst
+
+品种             K线数      min      中位数       均值      p90      p95      p99      max
+---------------------------------------------------------------------------------
+BITCOIN       1664   1.7990   4.2442   4.6854   7.0417   8.9242  11.8557  20.2460
+XAUUSD        2037   0.7330   1.3809   1.5098   2.3116   2.6034   3.5928   4.7502
+XAGUSD        2036   1.0837   2.5999   2.9877   4.6715   5.8538   8.9164  11.7141
+WTI           2037   1.8055   3.2304   3.7612   5.3363   7.2770  13.8969  24.9200
+
+建议异常波动率阈值（atr_pct >= 阈值 → abnormal=True）:
+  BITCOIN    99分位=11.8557%  均值+3σ=11.3707%  ->  建议阈值=11.8557%  (历史异常占比 1.02%)
+  XAUUSD     99分位=3.5928%  均值+3σ=3.2131%  ->  建议阈值=3.5928%  (历史异常占比 1.03%)
+  XAGUSD     99分位=8.9164%  均值+3σ=7.2816%  ->  建议阈值=8.9164%  (历史异常占比 1.03%)
+  WTI        99分位=13.8969%  均值+3σ=10.0768%  ->  建议阈值=13.8969%  (历史异常占比 1.03%)
+  取法: max(99分位, 均值+3σ) —— 两者取较稳妥者(更大者)。abnormal 触发
+  会屏蔽一切信号(宁可少报不漏报), 故阈值取保守方向; 如需更敏感可
+  改用 95 分位, 如需更保守可改用 99.5 分位。
+
+daemon 的 volatility['abnormal'] 判定现状（chan_wave_daemon.py compute_volatility）:
+  - 已有判定框架: 依赖 wave_engine details 的 bars_count / last_range,
+    判定规则: 最近一根周线K线波幅(last_range) > 周线ATR * ATR_ABNORMAL_MULT(3.0) -> abnormal=True。
+  - 但 wave_engine.compute 的 details 目前只输出 last_close / atr /
+    swings / label_checks, 从未输出 bars_count 与 last_range
+    -> compute_volatility 中 'if bars:' 恒为 False, abnormal 恒为 False,
+    判定实际是死代码, 从未生效。
+  - 接入点建议(二选一, 推荐A):
+    A. wave_engine.compute 的 details 补输出 last_range(最近一根K线
+       真实波幅 h-l) 与 bars_count, daemon 现有判定立即生效;
+    B. 在 daemon.compute_volatility 内用本报告的建议阈值直接判:
+       atr_pct(日线口径) >= 建议阈值 -> abnormal=True; 需注意 daemon
+       现用周线口径 atr_pct, 与本报告日线口径的量级不同, 建议先统一口径。
+
+注: 本报告为日线口径; daemon 现用周线口径 atr_pct。若采用建议 B,
+    建议在 daemon 侧对日线数据同样计算 atr_pct 后再比对阈值。
