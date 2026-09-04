@@ -7,22 +7,55 @@
 Exits when position disappears (SL hit / closed).
 Usage: python monitor_trade.py <ticket> <open_price> <sl_init> <r_size>
 """
-import sys, time, json, urllib.request, datetime
+import sys, time, json, urllib.request, datetime, os
 
 API = 'http://127.0.0.1:8080'
+LOCK = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.modify.lock')
+
+
+def acquire_lock(timeout=15):
+    """文件锁: 防多个 monitor 并发 /api/modify 串读结果 (2026-09-01 修复)"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            time.sleep(0.5)
+    return False
+
+
+def release_lock():
+    try:
+        os.remove(LOCK)
+    except Exception:
+        pass
+
 
 def api_get_positions():
     with urllib.request.urlopen(API + '/api/positions', timeout=10) as r:
         return json.loads(r.read().decode())
 
+
 def api_modify(ticket, sl=None, tp=None):
     payload = {'ticket': int(ticket)}
-    if sl is not None: payload['stop_loss'] = sl
-    if tp is not None: payload['take_profit'] = tp
-    req = urllib.request.Request(API + '/api/modify', data=json.dumps(payload).encode(),
-                                 headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read().decode())
+    if sl is not None:
+        payload['stop_loss'] = sl
+    if tp is not None:
+        payload['take_profit'] = tp
+    got = acquire_lock()
+    if not got:
+        print(f'[{datetime.datetime.now().strftime("%H:%M:%S")}] LOCK TIMEOUT, skip modify', flush=True)
+        return {'error': 'lock timeout'}
+    try:
+        req = urllib.request.Request(API + '/api/modify', data=json.dumps(payload).encode(),
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+    finally:
+        release_lock()
 
 ticket, open_p, sl, r = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 print(f'[{datetime.datetime.now().strftime("%H:%M:%S")}] monitor start: ticket={ticket} open={open_p} SL={sl} R={r}', flush=True)

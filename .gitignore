@@ -5,3 +5,8 @@ __pycache__/
 
 *.ex4
 
+
+# runtime state (do not commit)
+autotrade_log.txt
+orders_log.json
+*.bmp

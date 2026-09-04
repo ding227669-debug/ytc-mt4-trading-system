@@ -20,7 +20,6 @@ input int     MaxTradesPerDay = 1;          // 每天最多单数
 input int     DeadlineHour    = 19;         // 服务器时间收工 (未成交撤单)
 input double  MinBodyPct      = 0.0005;     // 中间K线最小实体 (占价格比例)
 input double  SLBuffer        = 0.0001;     // 止损缓冲 (0.01%)
-input int     MagicNumber     = 888001;     // EA 魔法号 (区分自己的订单)
 input bool    EnableAlert     = true;       // 信号/下单时 Alert 弹窗
 input bool    EnableLog       = true;       // 写 fvg_ea_log.txt
 
@@ -31,16 +30,12 @@ datetime g_rangeTime = 0;
 double g_rangeHigh = 0, g_rangeLow = 0;
 int    g_filledDay   = 0;        // 本日已成交单数
 string g_side        = "";
-int    g_failCount   = 0;       // 连续挂单失败次数 (防死循环重试)
-datetime g_lastFailTime = 0;    // 上次挂单失败时间 (冷却用)
-int    g_missCount   = 0;       // 挂单查询连续失败次数
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
    EventSetTimer(1);
    Log("FVG_Autotrader initialized on " + SymbolName + ", risk=" + DoubleToString(RiskPercent,1) + "%");
-   RestoreStateFromAccount();
    return(INIT_SUCCEEDED);
 }
 void OnDeinit(const int reason) { EventKillTimer(); }
@@ -87,9 +82,6 @@ void OnTick()
    // ---- 已成交数达标 / 已有挂单 → 不再挂 ----
    if (g_filledDay >= MaxTradesPerDay || g_fvgSignal) { CleanupPending(now, hm); return; }
 
-   // ---- 挂单失败冷却: 上次失败后 30 秒内不重试 ----
-   if (g_failCount > 0 && now - g_lastFailTime < 30) { CleanupPending(now, hm); return; }
-
    // ---- 2. 检测 FVG (M5, 仅 16:45 之后) ----
    MqlRates rt[];
    int got = CopyRates(SymbolName, PERIOD_M5, 0, 30, rt);
@@ -129,13 +121,12 @@ void OnTick()
    tp = (op == OP_BUYLIMIT) ? entry + 2 * stopDist : entry - 2 * stopDist;
    string cmt = "FVG auto " + g_side + " " + TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES);
 
-   int ticket = OrderSend(SymbolName, op, lots, entry, 3, sl, tp, cmt, MagicNumber, 0,
+   int ticket = OrderSend(SymbolName, op, lots, entry, 3, sl, tp, cmt, 0, 0,
                           (op == OP_BUYLIMIT) ? clrBlue : clrRed);
    if (ticket > 0)
    {
       g_pendingTicket = ticket;
       g_fvgSignal = true;
-      g_failCount = 0;
       Log("PENDING " + g_side + " lots=" + DoubleToString(lots,2) +
           " entry=" + DoubleToString(entry,1) + " sl=" + DoubleToString(sl,1) +
           " tp=" + DoubleToString(tp,1) + " ticket=" + IntegerToString(ticket));
@@ -146,13 +137,6 @@ void OnTick()
    else
    {
       Log("OrderSend FAIL: " + IntegerToString(GetLastError()));
-      g_failCount++;
-      g_lastFailTime = now;
-      if (g_failCount >= 3)
-      {
-         g_fvgSignal = true;   // 连续失败 3 次 → 本日停止, 不再骚扰服务器
-         Log("STOP: 挂单连续失败 " + IntegerToString(g_failCount) + " 次, 今日不再尝试");
-      }
    }
 }
 
@@ -211,14 +195,8 @@ void CleanupPending(datetime now, int hm)
       }
       else
       {
-         // 挂单查不到: 连续 3 次才确认消失 (防瞬时刷新误判)
-         g_missCount++;
-         if (g_missCount >= 3)
-         {
-            g_pendingTicket = 0;
-            g_filledDay++;
-            g_missCount = 0;
-         }
+         g_pendingTicket = 0;  // 挂单已消失 (成交或删除)
+         g_filledDay++;
       }
       // 到点撤单
       if (g_pendingTicket != 0 && hm >= DeadlineHour * 60)
@@ -237,44 +215,6 @@ void CleanupPending(datetime now, int hm)
 //+------------------------------------------------------------------+
 //| 日志 (追加)                                                     |
 //+------------------------------------------------------------------+
-//+------------------------------------------------------------------+
-//| 启动恢复: 扫描账户挂单/持仓/今日成交, 防止重复交易                |
-//+------------------------------------------------------------------+
-void RestoreStateFromAccount()
-{
-   // 1. 当前挂单/持仓
-   for (int i = OrdersTotal() - 1; i >= 0; i--)
-   {
-      if (!OrderSelect(i, SELECT_BY_POS)) continue;
-      if (OrderMagicNumber() != MagicNumber) continue;
-      int ot = OrderType();
-      if (ot == OP_BUYLIMIT || ot == OP_SELLLIMIT)
-      {
-         g_pendingTicket = OrderTicket();
-         g_fvgSignal = true;
-         g_side = (ot == OP_BUYLIMIT) ? "BUY" : "SELL";
-      }
-      else if (ot == OP_BUY || ot == OP_SELL)
-      {
-         g_filledDay++;
-         g_fvgSignal = true;
-      }
-   }
-   // 2. 今日开仓的成交单 (防重启/重挂后重复交易)
-   datetime dayStart = StrToTime(TimeToString(TimeCurrent(), TIME_DATE) + " 00:00:00");
-   for (int j = OrdersHistoryTotal() - 1; j >= 0; j--)
-   {
-      if (!OrderSelect(j, SELECT_BY_POS, MODE_HISTORY)) continue;
-      if (OrderMagicNumber() != MagicNumber) continue;
-      int ht = OrderType();
-      if ((ht == OP_BUY || ht == OP_SELL) && OrderOpenTime() >= dayStart) g_filledDay++;
-   }
-   if (g_filledDay > 0)
-      Log("RESTORE: 今日已有 " + IntegerToString(g_filledDay) + " 单成交, 不再新开");
-   if (g_pendingTicket != 0)
-      Log("RESTORE: 发现未成交挂单 ticket=" + IntegerToString(g_pendingTicket));
-}
-
 void Log(string s)
 {
    if (!EnableLog) return;
